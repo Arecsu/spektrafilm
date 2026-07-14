@@ -398,6 +398,37 @@ This is one of the most appealing aspects for me, especially when I think of
 printing large, high-resolution simulated images while retaining all this
 low-level grain detail that is not present in the original picture.
 
+## Native darktable module
+
+A native C implementation of the spektrafilm pipeline ships as a darktable
+darkroom module (`spektrafilm` in the "effects" group). The colour science is
+compiled into the module — no Python is needed at runtime — but the film
+profiles and spectral data must be exported from this repository first.
+
+### Generating the data pack
+
+```sh
+# one-time: export pack.json, spectra_lut.f32, and profile jsons
+uv run python3 export_pack.py
+
+# install to darktable's config directory
+cp -r build/spektrafilm/ ~/.config/darktable/spektrafilm/
+```
+
+The data pack contains:
+- `pack.json` — CIE CMFs, illuminant SPDs (D50/D55/D65/TH-KG3), dichroic filter
+  curves, neutral print filter database, spectral locus  
+- `spectra_lut.f32` — hanatos2025 spectral upsampling LUT  
+- `profiles/*.json` — 28 film and paper profiles
+
+After installation, restart darktable. The module reads the pack once at first
+use and caches it; re-run `export_pack.py` and reinstall to pick up updated
+profiles or spectral data.
+
+The C module (PR [#21534](https://github.com/darktable-org/darktable/pull/21534))
+lives in [Arecsu/darktable](https://github.com/Arecsu/darktable) on the
+`spektrafilm` branch.
+
 ## Preparing input images manually with darktable
 
 Direct RAW import in the GUI is the simplest workflow, but manual development is
