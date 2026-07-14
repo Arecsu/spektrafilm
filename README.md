@@ -407,23 +407,23 @@ profiles and spectral data must be exported from this repository first.
 
 ### Generating the data pack
 
-```sh
-# one-time: export pack.json, spectra_lut.f32, and profile jsons
-uv run python3 export_pack.py
+Requires the **dev branch** of spektrafilm:
 
-# install to darktable's config directory
-cp -r build/spektrafilm/ ~/.config/darktable/spektrafilm/
+```sh
+uv run --python 3.13 \
+  --with 'spektrafilm@git+https://github.com/andreavolpato/spektrafilm@dev' \
+  python3 export_pack.py -o ~/.config/darktable/spektrafilm
 ```
 
 The data pack contains:
-- `pack.json` — CIE CMFs, illuminant SPDs (D50/D55/D65/TH-KG3), dichroic filter
-  curves, neutral print filter database, spectral locus  
+- `pack.json` — CIE CMFs, illuminant SPDs, dichroic filter
+  curves, neutral print filter database, spectral locus, per-film render defaults  
 - `spectra_lut.f32` — hanatos2025 spectral upsampling LUT  
-- `profiles/*.json` — 28 film and paper profiles
+- `profiles/*.json` — 31 film and paper profiles (B&W stocks widened to 3 channels)
 
 After installation, restart darktable. The module reads the pack once at first
-use and caches it; re-run `export_pack.py` and reinstall to pick up updated
-profiles or spectral data.
+use and caches it; re-run `export_pack.py` to pick up updated profiles or
+spectral data from a new spektrafilm release.
 
 The C module (PR [#21534](https://github.com/darktable-org/darktable/pull/21534))
 lives in [Arecsu/darktable](https://github.com/Arecsu/darktable) on the
