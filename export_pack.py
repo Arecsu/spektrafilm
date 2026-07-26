@@ -28,20 +28,37 @@ from pathlib import Path
 import numpy as np
 
 
-def _widen3(v):
-    """[x] -> [x, x, x]; None-padded singles ([x, None, None]) also collapse."""
+def _chan3(v, bw):
+    """Normalise a per-channel parameter to exactly three values.
+
+    For a colour stock the three are passed through. For a single-emulsion (B&W)
+    stock there is only one channel: upstream reaches every per-channel constant
+    through match_channels(values, n_ch), which at n_ch == 1 returns values[:1] --
+    the FIRST channel, for all of them. Since the C engine runs on the widened
+    3-channel profile, that first value has to be replicated, or a B&W frame is
+    rendered with chromatic parameters. Schema defaults make this concrete:
+    rms_granularity is (6, 8, 10), scatter_core_um (2.2, 2.0, 1.6),
+    halation_strength (0.05, 0.015, 0.0) -- none of which are achromatic.
+
+    None-padded singles ([x, None, None]) collapse the same way.
+    """
     v = [x for x in v if x is not None]
-    return v * 3 if len(v) == 1 else v
+    if not v:
+        return v
+    if bw or len(v) == 1:
+        return [v[0]] * 3
+    return list(v)
 
 
-def _grain_export(params):
+def _grain_export(params, bw):
     gr = params.film_render.grain
     out = {
-        "rms_granularity": _widen3(gr.rms_granularity),
-        "uniformity": _widen3(gr.uniformity),
-        "density_min": _widen3(gr.density_min),
+        "rms_granularity": _chan3(gr.rms_granularity, bw),
+        "uniformity": _chan3(gr.uniformity, bw),
+        "density_min": _chan3(gr.density_min, bw),
     }
     if hasattr(gr, "particle_scale_sublayers"):
+        # sub-layer scales, not channels -- never collapsed
         out["particle_scale_sublayers"] = list(gr.particle_scale_sublayers)
     return out
 
@@ -63,7 +80,6 @@ def main() -> int:
         from spektrafilm.utils.gamut_compression import spectral_locus_xy
     except ImportError as err:
         print(f"error: spektrafilm must be importable ({err})", file=sys.stderr)
-        print("hint:  uv run --python 3.13 --with 'spektrafilm@git+https://github.com/andreavolpato/spektrafilm@dev' python3 export_pack.py -o ~/.config/darktable/spektrafilm", file=sys.stderr)
         return 1
 
     out = Path(args.output)
@@ -121,9 +137,15 @@ def main() -> int:
             continue
         dc = params.film_render.dir_couplers
         ha = params.film_render.halation
-        if getattr(params.film, "is_bw", False):
-            # single emulsion: upstream uses gamma_samelayer_rgb[0] only; on the
-            # widened 3-channel profile all channels must behave identically
+        bw = bool(getattr(params.film, "is_bw", False))
+        if bw:
+            # Single emulsion: upstream's matrix is 1x1 self-inhibition
+            # (compute_dir_couplers_matrix populates M_inter only for n_ch == 3),
+            # so it uses gamma_samelayer_rgb[0] and its interlayer entries are
+            # inert. They are NOT zero in couplers.toml -- defaults.bw.negative
+            # carries the colour values verbatim, deliberately -- so on the
+            # widened 3-channel profile they have to be zeroed here or every
+            # channel picks up its whole matrix COLUMN instead of the diagonal.
             g0 = dc.gamma_samelayer_rgb[0]
             dc.gamma_samelayer_rgb = (g0, g0, g0)
             dc.gamma_interlayer_r_to_gb = (0.0, 0.0)
@@ -140,17 +162,17 @@ def main() -> int:
                 "diffusion_tail_weight": dc.diffusion_tail_weight,
                 # Langmuir saturating couplers (spektrafilm dev/0.4+); absent
                 # on 0.3.x, in which case the engine uses the linear model
-                **({"langmuir_donor_k_rgb": list(dc.langmuir_donor_k_rgb),
-                    "langmuir_receiver_k_rgb": list(dc.langmuir_receiver_k_rgb)}
+                **({"langmuir_donor_k_rgb": _chan3(dc.langmuir_donor_k_rgb, bw),
+                    "langmuir_receiver_k_rgb": _chan3(dc.langmuir_receiver_k_rgb, bw)}
                    if hasattr(dc, "langmuir_donor_k_rgb") else {}),
             },
-            "grain": _grain_export(params),
+            "grain": _grain_export(params, bw),
             "halation": {
-                "strength": list(ha.halation_strength),
-                "first_sigma_um": list(ha.halation_first_sigma_um),
-                "scatter_core_um": list(ha.scatter_core_um),
-                "scatter_tail_um": list(ha.scatter_tail_um),
-                "scatter_tail_weight": list(ha.scatter_tail_weight),
+                "strength": _chan3(ha.halation_strength, bw),
+                "first_sigma_um": _chan3(ha.halation_first_sigma_um, bw),
+                "scatter_core_um": _chan3(ha.scatter_core_um, bw),
+                "scatter_tail_um": _chan3(ha.scatter_tail_um, bw),
+                "scatter_tail_weight": _chan3(ha.scatter_tail_weight, bw),
             },
         }
 
@@ -188,14 +210,30 @@ def main() -> int:
     print(f"wrote {out / 'spectra_lut.f32'} shape {lut.shape}")
 
     # --- stock profiles ------------------------------------------------------
-    # colour profiles are copied verbatim; single-emulsion B&W profiles
+    # Colour profiles are copied verbatim. Single-emulsion B&W profiles
     # (channel_model == "bw", spektrafilm dev/0.4+) are widened to the 3-channel
     # layout the C engine expects: per-channel arrays are triplicated and
-    # channel_density is divided by 3 so the spectral sum over channels equals
+    # channel_density is divided by 3, so the spectral sum over channels equals
     # the single emulsion's density spectrum. info.channel_model stays "bw" so
-    # the module can couple the grain across channels.
+    # the module can couple the grain across channels and collapse per-channel
+    # constants.
+    #
+    # Development-time families are NOT collapsed here any more. Some B&W stocks
+    # carry one density curve, base+fog spectrum and curve-model row per
+    # development time (kodak_doublex: 4/5/6.5/9/12 min, kodak_2302: 2/3.5/5/7/9
+    # min). Collapsing to upstream's default middle member at export time threw
+    # that away and made the choice unreachable from the module; keeping the
+    # family lets the module do what select_development_time() does, at render
+    # time, from a slider. `development_time` carries the full list of times, and
+    # its length is what tells the loader whether the arrays are a family or an
+    # already-widened single member -- so old packs keep loading unchanged.
+    #
+    # A family is exported with the development axis LAST on the 2-D arrays
+    # (density_curves (n_le, n_dev), base_density (n_wl, n_dev)) and FIRST on the
+    # curve model (centers (n_dev, n_layers)), which is how upstream stores them;
+    # the module selects a member and widens to 3 channels itself.
     profile_dir = pkg_resources.files("spektrafilm.data.profiles")
-    n = nbw = 0
+    n = nbw = nfam = 0
     for res in profile_dir.iterdir():
         if not res.name.endswith(".json"):
             continue
@@ -203,25 +241,46 @@ def main() -> int:
             prof = json.loads(p.read_text())
         if prof.get("info", {}).get("channel_model") == "bw":
             d = prof["data"]
-            # BW development-time families (push/pull data): collapse to the
-            # representative middle development time, exactly like upstream's
-            # select_development_time(None) does, BEFORE channel widening
             times = d.get("development_time") or []
+            n_dev = len(times)
             curves = d.get("density_curves") or []
-            if len(times) > 1 and curves and isinstance(curves[0], list) \
-               and len(curves[0]) == len(times):
-                idx = (len(times) - 1) // 2
-                d["density_curves"] = [[row[idx]] for row in curves]
-                base = d.get("base_density")
-                if base and isinstance(base[0], list):
-                    d["base_density"] = [row[idx] for row in base]
-                layers = d.get("density_curves_layers")
-                if layers and isinstance(layers[0], list) and isinstance(layers[0][0], list):
-                    d["density_curves_layers"] = [[[lay[idx]] for lay in row] for row in layers]
-                d["development_time"] = [times[idx]]
-            for key in ("log_sensitivity", "density_curves"):
-                if key in d and d[key] and isinstance(d[key][0], list) and len(d[key][0]) == 1:
-                    d[key] = [row * 3 for row in d[key]]
+            family = (n_dev > 1 and curves and isinstance(curves[0], list)
+                      and len(curves[0]) == n_dev)
+            if family:
+                # Leave density_curves, base_density and the curve model as the
+                # full family; only sanity-check that the model row count agrees,
+                # since a mismatch there is what silently summed N development
+                # fits together as if they were N sub-layers of one curve.
+                model = d.get("density_curves_model") or {}
+                for key in ("centers", "amplitudes", "sigmas", "alphas"):
+                    arr = model.get(key)
+                    if arr and len(arr) != n_dev:
+                        print(f"warning: {res.name}: density_curves_model.{key} has "
+                              f"{len(arr)} rows but development_time has {n_dev}; "
+                              f"not a development family, leaving as-is", file=sys.stderr)
+                        family = False
+                        break
+            if family:
+                nfam += 1
+            else:
+                # Single member (or no family at all): widen to 3 channels. The
+                # curve model's one row is REPEATED across 3 identical outer rows,
+                # not tripled element-wise, so each broadcast channel sums the
+                # same complete set of terms.
+                model = d.get("density_curves_model")
+                if model:
+                    for key in ("centers", "amplitudes", "sigmas", "alphas"):
+                        arr = model.get(key)
+                        if arr and len(arr) == 1:
+                            model[key] = arr * 3
+                for key in ("log_sensitivity", "density_curves"):
+                    if key in d and d[key] and isinstance(d[key][0], list) \
+                       and len(d[key][0]) == 1:
+                        d[key] = [row * 3 for row in d[key]]
+            # log_sensitivity is one panchromatic curve either way
+            if "log_sensitivity" in d and d["log_sensitivity"] \
+               and isinstance(d["log_sensitivity"][0], list) and len(d["log_sensitivity"][0]) == 1:
+                d["log_sensitivity"] = [row * 3 for row in d["log_sensitivity"]]
             if "channel_density" in d and d["channel_density"] \
                and isinstance(d["channel_density"][0], list) and len(d["channel_density"][0]) == 1:
                 d["channel_density"] = [
@@ -231,7 +290,7 @@ def main() -> int:
             nbw += 1
         (out / "profiles" / res.name).write_text(json.dumps(prof))
         n += 1
-    print(f"copied {n} profiles ({nbw} B&W widened to 3 channels)")
+    print(f"copied {n} profiles ({nbw} B&W, {nfam} carrying a development-time family)")
     return 0
 
 
