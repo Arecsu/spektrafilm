@@ -201,13 +201,57 @@ def main() -> int:
     (out / "pack.json").write_text(json.dumps(_sanitize(pack)))
     print(f"wrote {out / 'pack.json'} (spektrafilm {version})")
 
-    # --- hanatos2025 spectra LUT ---------------------------------------------
-    lut = np.ascontiguousarray(_load_hanatos2025_spectra_lut(), dtype=np.float32)
+    # --- spectral upsampling LUT ---------------------------------------------
+    # Written as float16, which is what upstream computes, ships and uses --
+    # src/spektrafilm/data/luts/spectral_upsampling/*.npy are float16 arrays.
+    # The previous float32 conversion here doubled the file (11.4 MiB against
+    # 5.7) for precision upstream never had.
+    #
+    # The header carries the LUT's identity as well as its shape. Upstream
+    # revises this table often (arctic2026 alpha, alpha02, beta01..beta04 so
+    # far) and each revision changes every render, so the engine has to be able
+    # to tell one from another rather than silently rendering differently. The
+    # content hash is authoritative -- the name is discovered when possible and
+    # is only there to make the mismatch message readable.
+    lut_raw = _load_hanatos2025_spectra_lut()
+    lut = np.ascontiguousarray(lut_raw, dtype=np.float16)
+
+    lut_name = "unknown"
+    for attr in ("SPECTRAL_UPSAMPLING_LUT", "HANATOS2025_LUT_NAME"):
+        try:
+            from spektrafilm import config as _cfg
+            lut_name = str(getattr(_cfg, attr))
+            break
+        except (ImportError, AttributeError):
+            pass
+    if lut_name == "unknown":
+        # fall back to the newest LUT shipped in the package
+        try:
+            lutdir = pkg_resources.files("spektrafilm.data.luts.spectral_upsampling")
+            names = sorted(r.name[:-4] for r in lutdir.iterdir() if r.name.endswith(".npy"))
+            if names:
+                lut_name = names[-1]
+        except Exception:
+            pass
+
+    # FNV-1a over the raw bytes; the engine reads this value, it does not
+    # recompute it, so any stable hash will do
+    h = 2166136261
+    for b in lut.tobytes():
+        h = ((h ^ b) * 16777619) & 0xFFFFFFFF
+    lut_id = f"{lut_name}@{version}".encode("utf-8")[:255]
+
     with open(out / "spectra_lut.f32", "wb") as fh:
-        fh.write(b"SFSL")
+        fh.write(b"SFS2")
+        fh.write(struct.pack("<i", 2))                 # header version
         fh.write(struct.pack("<iii", *lut.shape))
+        fh.write(struct.pack("<i", 1))                 # 0 = float32, 1 = float16
+        fh.write(struct.pack("<I", h))                 # content hash
+        fh.write(struct.pack("<i", len(lut_id)))
+        fh.write(lut_id)
         fh.write(lut.tobytes())
-    print(f"wrote {out / 'spectra_lut.f32'} shape {lut.shape}")
+    print(f"wrote {out / 'spectra_lut.f32'} shape {lut.shape} float16 "
+          f"id={lut_id.decode()} hash={h:08x}")
 
     # --- stock profiles ------------------------------------------------------
     # Colour profiles are copied verbatim. Single-emulsion B&W profiles
